@@ -1,0 +1,145 @@
+# API Glowy
+
+Routes Next.js (`src/app/api`). Toutes les réponses sont en JSON :
+
+- succès : `{ "data": … }`
+- erreur : `{ "error": { "code": "SLOT_TAKEN", "message": "…", "details": [...] } }`
+
+Les codes d'erreur sont stables : l'interface les traduit (`t.errors`). Validation des entrées avec Zod (`400 VALIDATION`).
+Authentification par cookie de session Auth.js ; `401 UNAUTHORIZED` sans session, `403 FORBIDDEN` si le rôle ne convient pas.
+Les requêtes d'écriture venant d'une autre origine sont refusées (`403`, protection CSRF).
+Limitation de débit (`429 RATE_LIMITED`) : inscription 10/h et connexion 20/10 min par adresse, mot de passe oublié 5/15 min, réservation 15/h par compte, assistante 6/min, envois de fichiers 30/h (`RATE_LIMITS=off` pour les tests automatisés).
+Dates : `400 VALIDATION` pour une date impossible (`2026-13-45`, `2026-02-30`).
+
+Dates : `AAAA-MM-JJ`, heures : `HH:MM`, en heure de Tunis. Montants en dinars entiers.
+
+## Authentification (P1)
+
+| Méthode | Route | Accès | Description |
+| --- | --- | --- | --- |
+| POST | `/api/auth/register` | public | Inscription. `type: "client"` (actif tout de suite) ou `type: "salon"` (gérant + salon en attente de validation). `409 EMAIL_TAKEN` |
+| POST | `/api/auth/password/forgot` | public | `{ email }` → lien de réinitialisation valable 1 h (au plus un par minute). Même réponse si le compte n'existe pas. Réponse `{ sent, simulated }` : `simulated` vaut `true` sans serveur SMTP |
+| POST | `/api/auth/password/reset` | public | `{ token, password }` → nouveau mot de passe. `400 INVALID_TOKEN` si le lien est expiré ou déjà utilisé |
+| GET/POST | `/api/auth/*` | public | Points d'accès Auth.js : `csrf`, `session`, `signout`, `callback/credentials`, `callback/demo` |
+
+Connexion côté interface : `signIn("credentials", { email, password, redirect: false })` (codes `invalid_credentials`, `account_locked`, `account_blocked`).
+
+## Salons et réservation (P3)
+
+| Méthode | Route | Accès | Description |
+| --- | --- | --- | --- |
+| GET | `/api/salons?q=&ville=&categorie=&tri=` | public | Recherche (salons validés uniquement). `tri` : `recommande` · `note` · `prix` · `distance` |
+| GET | `/api/salons/:slug` | public | Fiche : services groupés, équipe, horaires, avis vérifiés, répartition des notes |
+| GET | `/api/salons/:slug/availability?date=&services=a,b&employee=` | public | Créneaux de 30 min avec les employés libres pour la durée totale des prestations |
+| GET | `/api/bookings` | cliente | Historique de la cliente connectée |
+| POST | `/api/bookings` | cliente | Demande de réservation : statut `PENDING` (créneau gardé) jusqu'à la confirmation du salon. `409 SLOT_TAKEN` si le créneau vient d'être pris |
+| PATCH | `/api/bookings/:id` | cliente / salon | `{ action }` : voir ci-dessous |
+
+Corps de `POST /api/bookings` :
+
+```json
+{
+  "salonSlug": "salon-yasmine-la-marsa",
+  "serviceKeys": ["coupe-brushing"],
+  "employee": "any",
+  "date": "2026-10-05",
+  "time": "11:00",
+  "paymentMethod": "ONLINE",
+  "note": "Cuir chevelu sensible"
+}
+```
+
+Actions de `PATCH /api/bookings/:id` :
+
+| action | Qui | Effet |
+| --- | --- | --- |
+| `cancel` | cliente ou salon | Annule (pour le salon, refuser une demande en attente). Cliente à moins de `cancellationHours` du rendez-vous : annulation tardive, acompte conservé, −20 pts |
+| `reschedule` + `date`, `time` | cliente | Déplace le rendez-vous (même employé, même durée) |
+| `confirm` | salon | Accepte la demande : `PENDING` → `CONFIRMED`, la cliente est prévenue (notification, e-mail, SMS) |
+| `start` | salon | En cours |
+| `complete` | salon | Terminé → événement `booking.completed` (points, droit à l'avis) |
+| `noShow` | salon | Absente → −20 pts |
+
+`start` est possible au plus tôt 30 min avant le rendez-vous ; `complete` (sauf rendez-vous déjà commencé) et `noShow` seulement après son heure : sinon `409 TOO_EARLY`.
+
+Règles de réservation (recette du 7 novembre 2026) : heure prise dans la grille de 30 min depuis l'ouverture (`400 OFF_GRID`), au plus 90 jours à l'avance (`400 TOO_FAR`), jamais deux rendez-vous actifs qui se chevauchent pour une même cliente, tous salons confondus (`409 CLIENT_BUSY`), au plus 3 demandes en attente par cliente (`409 TOO_MANY_PENDING`). Après l'heure du rendez-vous : la cliente ne peut plus annuler (`409 ALREADY_STARTED`), le salon ne peut plus confirmer une demande (`409 TOO_LATE`), et la tâche planifiée la fait expirer (acompte remboursé). Le salon peut annuler un rendez-vous confirmé à venir (`cancel`). Un avis publié est retiré si le salon marque ensuite la cliente absente (points de l'avis repris).
+La réponse de `POST /api/bookings` contient aussi `employeeKey` : le professionnel attribué, même avec `employee: "any"`.
+
+**Fonctions réservées aux plans** (routes du dashboard) : `403 PLAN_REQUIRED` (`details.plan` = plan minimal) pour le CRM, les statistiques et exports, les promotions (Pro) et les stocks et succursales (Premium) ; `409 PLAN_LIMIT` au-delà du nombre de professionnels actifs du plan (Gratuit 1, Pro 8, Premium illimité).
+
+## Espace client (P5)
+
+| Méthode | Route | Accès | Description |
+| --- | --- | --- | --- |
+| GET / PATCH | `/api/me` | connecté | Profil (CLI-01). Profil complet (téléphone, ville, date de naissance) : +20 pts une fois |
+| PUT | `/api/me/favorites` | connecté | `{ salonSlug, favorite }` |
+| GET / PATCH | `/api/me/notifications` | connecté | 30 dernières notifications ; PATCH = tout marquer comme lu |
+| GET | `/api/me/loyalty` | cliente | Solde, cumul, niveau, historique, catalogue |
+| POST | `/api/me/loyalty/redeem` | cliente | `{ rewardId }` → `{ code }`. `409 INSUFFICIENT_POINTS` |
+
+## Avis (P4)
+
+| Méthode | Route | Accès | Description |
+| --- | --- | --- | --- |
+| POST | `/api/reviews` | cliente | `{ bookingId, rating 1–5, text, photoUrl?, lang }` — dès que l'heure du rendez-vous est passée, même si le salon ne l'a pas encore marqué terminé ; jamais sur une annulation ou une absence (`409 BOOKING_NOT_COMPLETED`, `409 ALREADY_REVIEWED`) |
+| PATCH | `/api/reviews/:id` | selon l'action | `reply` (gérant) · `report` (tous sauf l'autrice : `409 OWN_REVIEW`) · `hide` / `keep` (Super Admin, journalisé) |
+
+## Dashboard salon (P2)
+
+| Méthode | Route | Accès | Description |
+| --- | --- | --- | --- |
+| GET | `/api/dashboard/agenda?date=` | gérant, employé, admin | Employés, rendez-vous et blocages du jour (le gérant ne voit que son salon) |
+
+## Super Admin (P1)
+
+| Méthode | Route | Accès | Description |
+| --- | --- | --- | --- |
+| GET | `/api/admin/overview` | admin | Chiffres clés, salons en attente, répartition des offres, journal d'audit |
+| PATCH | `/api/admin/salons/:id` | admin | `{ action: approve · reject · suspend · reactivate, reason? }` — `approve` attribue le badge « Salon vérifié » |
+| PATCH | `/api/admin/users/:id` | admin | `{ action: block · unblock }` — un compte bloqué perd l'accès immédiatement |
+
+## Abonnements (P5 · P1, ADM-05)
+
+Le gérant règle son plan Pro (79 DT) ou Premium (149 DT) hors ligne (virement, D17, espèces) et déclare le paiement avec sa référence. Le plan reste gratuit tant que le Super Admin n'a pas accepté : à l'acceptation il est actif **30 jours** (renouvellement possible 7 jours avant l'échéance, la période se prolonge). Un refus est motivé.
+
+| Méthode | Route | Rôle | Description |
+| --- | --- | --- | --- |
+| `GET` | `/api/subscriptions` | Gérant | Plan en cours, échéance, jours restants, demande en attente, historique |
+| `POST` | `/api/subscriptions` | Gérant | `{ plan: pro \| premium, channel: VIREMENT \| D17 \| ESPECES, reference, note? }` → 201 ; `409 PENDING_EXISTS` (une demande à la fois), `409 ALREADY_ACTIVE` |
+| `GET` | `/api/admin/payments` | Super Admin | Paiements à valider, 15 dernières décisions, revenus 30 j, revenu mensuel récurrent, plans actifs |
+| `PATCH` | `/api/admin/payments/:id` | Super Admin | `{ action: accept }` ou `{ action: refuse, reason }` ; `409 ALREADY_DECIDED` si déjà traité |
+
+Un salon qui choisit un plan payant à l'inscription démarre en plan gratuit avec une demande de paiement en attente.
+
+## IA (modèles Groq et Gemini, algorithme local en secours)
+
+| Méthode | Route | Accès | Rôle |
+|---|---|---|---|
+| POST | `/api/ai/chat` | tous (6 / minute) | `{ message, salonSlug?, history? }` → créneaux réels ou réponse de l'assistante (Groq GPT-OSS 120B, Gemini en secours, règles en dernier recours). `masked` : message renvoyé avec les gros mots masqués |
+| GET | `/api/ai/recommendations?limit=6&discover=1` | tous | salons recommandés : `score`, `reason` (score local) ou `aiReason` (raison écrite par Gemini pour une cliente qui a un historique) |
+| POST | `/api/ai/reviews/analyze` | connecté | `{ text, rating }` → `{ sentiment, score, aspects, suspicion, suspicionReason?, source }` ; `source` = `ai` (Gemini) ou `lexicon` / `rating` (règles) |
+| POST | `/api/ai/beauty` | tous (10 / minute) | `{ mode, metrics, image? }` → diagnostic. `image` : photo réduite (data URL JPEG, 768 px) regardée par Gemini Vision puis oubliée ; `note` : explication de l'IA ; `source` = `ai` ou `rules`. `retake.reason = subject` si aucun visage ou cheveu n'est visible |
+| POST | `/api/ai/try-on` | tous (6 / 10 min et 20 / jour par personne, 300 / jour pour la plateforme) | `{ shade, image, small, width, height }` → `{ image, shade }` : rendu photoréaliste de l'essai couleur. Fournisseurs dans l'ordre : FLUX.2 [klein] 4B sur Cloudflare Workers AI (gratuit, `small` = photo de moins de 512 px), puis Gemini (`image` = photo de travail de 1024 px au plus, payant) si le premier a épuisé son quota. Photos envoyées seulement à la demande de la cliente puis oubliées ; le navigateur ne recolle que les cheveux du rendu sur la photo d'origine. Erreurs : `TRY_ON_UNAVAILABLE` (503 : aucun fournisseur, quotas atteints), `TRY_ON_BLOCKED` (422), `TRY_ON_FAILED` (502) |
+
+## Supervision
+
+| Méthode | Route | Description |
+| --- | --- | --- |
+| GET | `/api/health` | État de l'application et de la base |
+
+## Événements internes
+
+Émis par les modules (`src/core/domain/events.ts`), traités dans `src/modules/subscribers.ts` :
+
+| Événement | Émis par | Réactions |
+| --- | --- | --- |
+| `user.registered` | inscription | Notification de bienvenue |
+| `salon.registered` | inscription salon | Notification aux Super Admins ; demande de paiement si plan payant |
+| `salon.statusChanged` | Super Admin | Notification + e-mail au gérant |
+| `plan.paymentRequested` | gérant / inscription d'un salon | Notification aux Super Admins |
+| `plan.paymentDecided` | Super Admin | Notification + e-mail au gérant |
+| `booking.created` | réservation | Notifications cliente et salon, e-mail (réel si SMTP est configuré) et SMS (simulé) |
+| `booking.cancelled` | annulation | Pénalité si tardive, notification |
+| `booking.completed` | salon | Points : +10, +30 nouveau salon, paliers 3/5/10 salons, heure creuse, paiement en ligne, réservation 48 h à l'avance, parrainage |
+| `booking.noShow` | salon | −20 pts |
+| `review.published` | avis | +15 pts (+10 avec photo, 1 avis récompensé par salon et par mois), notification au salon |

@@ -1,0 +1,97 @@
+import type { BookingStatus, PaymentMethod } from "@/core/domain/enums";
+import { toMinutes } from "@/core/domain/time";
+
+/** Règles de réservation (P3, RES-03 à RES-05) — fonctions pures, testées sans base de données. */
+
+/** Statuts qui occupent l'agenda d'un employé */
+export const ACTIVE_STATUSES: readonly BookingStatus[] = ["PENDING", "CONFIRMED", "IN_PROGRESS"];
+export const isActive = (status: BookingStatus) => ACTIVE_STATUSES.includes(status);
+
+/** Pas des créneaux proposés */
+export const SLOT_STEP_MIN = 30;
+/** Délai minimal entre maintenant et le début d'un créneau réservable */
+export const MIN_LEAD_MIN = 15;
+/** Grain du verrou anti double réservation (durées et horaires multiples de 5 min) */
+export const LOCK_GRAIN_MIN = 5;
+
+/**
+ * Heure creuse (+10 pts) : heures prévues calmes par la prédiction d'affluence du salon (IA P2) ;
+ * repli quand le salon n'a pas assez d'historique : lun.–mer., 10 h – 12 h.
+ */
+export const isOffPeak = (weekday: number, minutes: number, forecastHours?: number[] | null) =>
+  forecastHours ? forecastHours.includes(Math.floor(minutes / 60)) : weekday >= 1 && weekday <= 3 && minutes >= 600 && minutes < 720;
+
+/**
+ * Acompte en ligne : `percent` % du total réglé par le salon (SAL-07, 20 % par défaut, 0 = pas d'acompte),
+ * borné entre 10 et 30 DT et jamais au-delà du total. Même règle dans le tunnel de réservation.
+ */
+export const depositFor = (total: number, method: PaymentMethod, percent = 20) =>
+  method === "ONLINE" && total > 0 && percent > 0 ? Math.min(total, 30, Math.max(10, Math.round((total * percent) / 100))) : 0;
+
+/** Réservation possible au plus 90 jours à l'avance (au-delà : agendas et horaires pas encore connus) */
+export const BOOKING_HORIZON_DAYS = 90;
+export const isBeyondHorizon = (startsAt: Date, now: Date) => startsAt.getTime() > now.getTime() + BOOKING_HORIZON_DAYS * 86_400_000;
+
+/** Demandes en attente de confirmation par cliente : au-delà, un compte bloquerait l'agenda des salons */
+export const MAX_PENDING_PER_CLIENT = 3;
+
+/** L'heure est-elle l'un des créneaux proposés (pas de 30 min depuis l'ouverture) ? Refuse « 11:07 ». */
+export const isOnSlotGrid = (minutes: number, opensAt: string) => minutes >= toMinutes(opensAt) && (minutes - toMinutes(opensAt)) % SLOT_STEP_MIN === 0;
+
+/** L'heure du rendez-vous est-elle arrivée ? */
+export const hasStarted = (startsAt: Date, now: Date) => startsAt.getTime() <= now.getTime();
+
+/** Le créneau commence-t-il trop tôt pour être encore réservé ? */
+export const startsTooSoon = (startsAt: Date, now: Date) => startsAt.getTime() < now.getTime() + MIN_LEAD_MIN * 60_000;
+
+/** Annulation ou report à moins de `cancellationHours` du rendez-vous = tardif (RES-05) */
+export const isWithinCancellationWindow = (startsAt: Date, now: Date, cancellationHours: number) =>
+  startsAt.getTime() - now.getTime() < cancellationHours * 3_600_000;
+
+/** Suivi du rendez-vous par le salon */
+export const TRANSITIONS = {
+  /** Le salon accepte la demande de la cliente */
+  confirm: { from: ["PENDING"], to: "CONFIRMED" },
+  start: { from: ["PENDING", "CONFIRMED"], to: "IN_PROGRESS" },
+  complete: { from: ["PENDING", "CONFIRMED", "IN_PROGRESS"], to: "COMPLETED" },
+  noShow: { from: ["PENDING", "CONFIRMED"], to: "NO_SHOW" },
+} as const satisfies Record<string, { from: readonly BookingStatus[]; to: BookingStatus }>;
+
+export type StaffAction = keyof typeof TRANSITIONS;
+
+/** Statut d'arrivée, ou null si le changement est interdit depuis le statut actuel */
+export function nextStatus(action: StaffAction, current: BookingStatus): BookingStatus | null {
+  const transition = TRANSITIONS[action];
+  return (transition.from as readonly BookingStatus[]).includes(current) ? transition.to : null;
+}
+
+/** « Commencer » un rendez-vous est possible au plus tôt 30 minutes avant l'heure prévue */
+export const EARLY_START_MIN = 30;
+
+/**
+ * Le salon agit-il trop tôt ? On ne commence pas un rendez-vous plus de 30 min à l'avance, et on ne le marque
+ * « terminé » ou « absente » qu'une fois l'heure passée (sinon : points crédités ou pénalité de −20 pts à tort).
+ * Un rendez-vous déjà commencé peut être terminé à tout moment.
+ */
+export function isTooEarly(action: StaffAction, current: BookingStatus, startsAt: Date, now: Date) {
+  if (action === "confirm" || (action === "complete" && current === "IN_PROGRESS")) return false;
+  const opensAt = startsAt.getTime() - (action === "start" ? EARLY_START_MIN * 60_000 : 0);
+  return now.getTime() < opensAt;
+}
+
+/** Une demande dont l'heure est passée ne peut plus être acceptée : le salon la refuse, sinon elle expire */
+export const isTooLate = (action: StaffAction, startsAt: Date, now: Date) => action === "confirm" && hasStarted(startsAt, now);
+
+/** Actions proposées au salon pour un rendez-vous, à l'instant `now` (boutons du dashboard) */
+export const staffActions = (current: BookingStatus, startsAt: Date, now: Date) =>
+  (Object.keys(TRANSITIONS) as StaffAction[]).filter(
+    (action) => nextStatus(action, current) && !isTooEarly(action, current, startsAt, now) && !isTooLate(action, startsAt, now)
+  );
+
+/** Tranches de LOCK_GRAIN_MIN minutes couvertes par [start, end[ — clés du verrou en base */
+export function lockSlices(start: Date, end: Date) {
+  const grain = LOCK_GRAIN_MIN * 60_000;
+  const slices: Date[] = [];
+  for (let t = Math.floor(start.getTime() / grain) * grain; t < end.getTime(); t += grain) slices.push(new Date(t));
+  return slices;
+}

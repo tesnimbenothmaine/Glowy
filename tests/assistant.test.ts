@@ -1,0 +1,131 @@
+import "./setup";
+import assert from "node:assert/strict";
+import { after, beforeEach, describe, test } from "node:test";
+import { addDays, tunisToUtc } from "@/core/domain/time";
+import { Salon } from "@/infrastructure/db";
+import { audienceOf, chat, detectLang, matchesTime, parseMessage, pickService } from "@/modules/assistant";
+import { closeDb, FUTURE_MONDAY, makeSalon, resetDb } from "./helpers";
+
+const MONDAY_9AM = tunisToUtc(FUTURE_MONDAY, "09:00");
+/** Jour J + n à partir du lundi de test (mardi = 1, jeudi = 3, samedi = 5) */
+const day = (n: number) => addDays(FUTURE_MONDAY, n);
+const CITIES = ["Tunis", "La Marsa", "El Menzah"];
+
+describe("IA P3 : assistante de réservation", () => {
+  beforeEach(resetDb);
+  after(closeDb);
+
+  test("comprend prestation, jour, moment, heure et ville en français, anglais et arabe", () => {
+    const fr = parseMessage("Je voudrais une coupe demain matin à La Marsa", MONDAY_9AM, CITIES);
+    assert.deepEqual([fr.intent, fr.service, fr.date, fr.part, fr.city], ["book", "coupe", day(1), "morning", "La Marsa"]);
+    const en = parseMessage("Manicure on Saturday at 3pm", MONDAY_9AM, CITIES);
+    assert.deepEqual([en.service, en.date, en.time], ["ongles", day(5), "15:00"]);
+    const ar = parseMessage("نحب مساج نهار الخميس العشية", MONDAY_9AM, CITIES);
+    assert.deepEqual([ar.service, ar.date, ar.part], ["massage", day(3), "afternoon"]);
+    assert.equal(parseMessage("Comment annuler mon rendez-vous ?", MONDAY_9AM, CITIES).topic, "cancel");
+    assert.equal(parseMessage("Bonjour", MONDAY_9AM, CITIES).intent, "greeting");
+    assert.equal(parseMessage("blablabla", MONDAY_9AM, CITIES).intent, "unknown");
+    // Prochain 15 janvier à partir du lundi de test
+    const jan15 = `${Number(FUTURE_MONDAY.slice(0, 4)) + (FUTURE_MONDAY.slice(5) > "01-15" ? 1 : 0)}-01-15`;
+    assert.equal(parseMessage("rdv le 15/01 à 14h30", MONDAY_9AM, CITIES).date, jan15);
+  });
+
+  test("filtre les créneaux selon l'heure ou le moment demandés", () => {
+    assert.equal(matchesTime("10:30", { part: "morning", time: null }), true);
+    assert.equal(matchesTime("14:00", { part: "morning", time: null }), false);
+    assert.equal(matchesTime("15:30", { part: null, time: "15:00" }), true);
+    assert.equal(matchesTime("17:30", { part: null, time: "15:00" }), false);
+  });
+
+  test("propose de vrais créneaux libres, sinon une question ou le repli", async () => {
+    await makeSalon("salon-a");
+    const reply = await chat({ message: "une coupe demain matin à Tunis" }, undefined, MONDAY_9AM);
+    assert.equal(reply.kind, "slots");
+    if (reply.kind === "slots") {
+      assert.equal(reply.slots[0].slug, "salon-a");
+      assert.equal(reply.slots[0].serviceKey, "coupe");
+      assert.equal(reply.slots[0].date, day(1));
+      assert.ok(reply.slots[0].time < "12:00", "le matin");
+    }
+    assert.equal((await chat({ message: "je veux réserver demain" }, undefined, MONDAY_9AM)).kind, "clarify");
+    assert.equal((await chat({ message: "manucure demain" }, undefined, MONDAY_9AM)).kind, "none", "aucun salon d'ongles");
+    assert.equal((await chat({ message: "quels sont vos horaires ?", salonSlug: "salon-a" }, undefined, MONDAY_9AM)).kind, "faq");
+    assert.equal((await chat({ message: "xyz" }, undefined, MONDAY_9AM)).kind, "fallback");
+  });
+
+  test("gros mots masqués avant tout traitement, la demande reste comprise", async () => {
+    await makeSalon("salon-a");
+    const greeting = await chat({ message: "aslema si zebi" }, undefined, MONDAY_9AM);
+    assert.deepEqual([greeting.kind, greeting.masked], ["greeting", "aslema si ****"]);
+    const rude = await chat({ message: "Ton salon c'est de la merde, je veux une coupe demain matin à Tunis" }, undefined, MONDAY_9AM);
+    assert.equal(rude.kind, "slots", "la demande est traitée malgré l'insulte");
+    assert.equal(rude.masked, "Ton salon c'est de la *****, je veux une coupe demain matin à Tunis");
+    assert.equal((await chat({ message: "une coupe demain matin à Tunis" }, undefined, MONDAY_9AM)).masked, undefined, "message poli inchangé");
+  });
+
+  test("choix de la prestation du salon : public demandé, mots du client, puis la moins chère", () => {
+    const menu = ["Coupe + soin hydratant 65", "Coupe femme + brushing 35", "Brushing 20", "Coupe enfant (-12 ans) 15", "Coupe + brushing 35", "Coupe homme 15", "Mariée : essai + jour J 320", "Chignon de mariée 120"].map((line) => {
+      const price = Number(line.split(" ").at(-1));
+      return { name: line.replace(/ \d+$/, ""), price, active: true };
+    });
+    assert.equal(pickService(menu, "coupe", "Je veux une coupe homme")?.name, "Coupe homme");
+    assert.equal(pickService(menu, "coupe", "coupe femme demain matin")?.name, "Coupe femme + brushing");
+    assert.equal(pickService(menu, "coupe", "nheb n9os cha3ri ghodwa")?.name, "Coupe + brushing", "sans public précis : ni enfant ni homme");
+    assert.equal(pickService(menu, "brushing", "un brushing samedi")?.name, "Brushing");
+    assert.equal(pickService(menu, "chignon", "أريد موعدا لتسريحة عروس")?.name, "Chignon de mariée");
+    assert.equal(pickService([{ name: "Coupe femme", price: 30, active: true }], "coupe", "coupe homme"), undefined, "jamais une coupe femme pour un homme");
+  });
+
+  test("un homme (« ena rajl », « n7ajem ») : coupe homme ou barbier, jamais une coupe femme ni un brushing", () => {
+    for (const said of ["ena rajl ou in7b n7ajem", "t7ajem lil rjel?", "nheb n7ajjem ghodwa", "نحب نحجّم غدوة", "je suis un homme, une coupe svp"]) assert.equal(audienceOf(said), "homme", said);
+    assert.equal(audienceOf("coupe femme"), "femme");
+    assert.equal(audienceOf("ena rajl ama el coupe l mrati, coupe femme"), "femme", "le dernier public dit l'emporte");
+    assert.equal(audienceOf("nheb n9os cha3ri"), null);
+    assert.equal(parseMessage("ena rajl ou in7b n7ajem", MONDAY_9AM, CITIES).service, "coupe");
+    assert.equal(parseMessage("nheb n9assar le7ya", MONDAY_9AM, CITIES).service, "barbe");
+    assert.equal(parseMessage("Can I book a beard trim tomorrow evening?", MONDAY_9AM, CITIES).service, "barbe", "IA-11 : trim de barbe");
+    assert.equal(parseMessage("nheb n9os le7ya ghodwa", MONDAY_9AM, CITIES).service, "barbe");
+    assert.equal(parseMessage("a quick trim tomorrow", MONDAY_9AM, CITIES).service, "coupe");
+    assert.equal(parseMessage("une coupe chez le barbier samedi", MONDAY_9AM, CITIES).service, "coupe", "barbier = lieu, pas la barbe");
+    assert.equal(parseMessage("coupe et barbe samedi", MONDAY_9AM, CITIES).service, "coupe", "mot de cheveux : coupe d'abord");
+
+    const item = (name: string, price: number) => ({ name, price, active: true });
+    const yasmine = [item("Coupe + soin hydratant", 65), item("Coupe femme + brushing", 35), item("Coupe + brushing", 30), item("Coupe homme", 15), item("Taille de barbe", 10)];
+    assert.equal(pickService(yasmine, "coupe", "ena rajl ou in7b n7ajem", "coiffure")?.name, "Coupe homme");
+    assert.equal(pickService([item("Coupe femme", 30), item("Coupe + brushing", 25)], "coupe", "ena rajl ou in7b n7ajem", "coiffure"), undefined, "coiffeur sans coupe homme : aucun créneau");
+    assert.equal(pickService([item("Coupe", 20), item("Taille de barbe", 10)], "coupe", "n7ajem", "barbier")?.name, "Coupe", "chez le barbier, la coupe est pour homme");
+    assert.equal(pickService([item("Coupe homme", 20)], "coupe", "coupe femme", "barbier"), undefined, "jamais le barbier pour une femme");
+    assert.equal(pickService(yasmine, "barbe", "ena rajl, nheb nhezz le7ya", "coiffure")?.name, "Taille de barbe");
+  });
+
+  test("mots arabes, derja et anglais reliés aux noms des prestations (IA-07) : « مساج » → massage, pas le forfait le moins cher", () => {
+    const spa = [{ name: "Hammam + gommage", price: 60, active: true }, { name: "Massage relaxant", price: 90, active: true }, { name: "Rituel duo", price: 220, active: true }];
+    assert.equal(pickService(spa, "massage", "نحب نعمل مساج غدوة العشية في الحمامات")?.name, "Massage relaxant");
+    assert.equal(pickService(spa, "massage", "nheb massaj ghodwa")?.name, "Massage relaxant");
+    assert.equal(pickService(spa, "massage", "نحب حمام ghodwa")?.name, "Hammam + gommage");
+    assert.equal(pickService(spa, "massage", "nheb 7ammam nhar essebt")?.name, "Hammam + gommage");
+    assert.equal(pickService(spa, "massage", "un soin au spa")?.name, "Hammam + gommage", "sans précision : la moins chère");
+  });
+
+  test("un homme qui veut se faire couper les cheveux : créneaux chez le barbier, pas de coupe femme chez le coiffeur", async () => {
+    await makeSalon("salon-a");
+    await Salon.updateOne({ slug: "salon-a" }, { $set: { services: [{ key: "coupe-femme", name: "Coupe femme", group: "Coupe", durationMin: 30, price: 30 }] } });
+    await makeSalon("barber-b");
+    await Salon.updateOne({ slug: "barber-b" }, { $set: { category: "barbier", services: [{ key: "coupe-homme", name: "Coupe homme", group: "Coupe", durationMin: 30, price: 15 }] } });
+    const reply = await chat({ message: "ena rajl w nheb n7ajem ghodwa sbe7" }, undefined, MONDAY_9AM);
+    assert.equal(reply.kind, "slots");
+    if (reply.kind === "slots") assert.deepEqual([...new Set(reply.slots.map((s) => `${s.slug} ${s.serviceName}`))], ["barber-b Coupe homme"]);
+  });
+
+  test("langue de la réponse : tounsi en arabizi ou en lettres arabes, arabe, français, anglais", () => {
+    assert.equal(detectLang("aslema"), "tn_arabizi");
+    assert.equal(detectLang("9addech el brushing fi Sousse ?"), "tn_arabizi");
+    assert.equal(detectLang("Bonjour, nheb coupe ghodwa"), "tn_arabizi");
+    assert.equal(detectLang("قداش المانيكير في المنزه؟"), "tn_arabe");
+    assert.equal(detectLang("أريد حجز موعد غدا"), "ar");
+    assert.equal(detectLang("Je voudrais une coupe le 15/01 à 14h30"), "fr");
+    assert.equal(detectLang("What is the best salon for a haircut?"), "en");
+    assert.equal(detectLang("Can I book a beard trim on Tuesday evening at Les Berges du Lac?"), "en", "le nom du lieu ne compte pas comme du français");
+    assert.equal(detectLang("Une coupe lundi matin à La Marsa"), "fr");
+  });
+});
